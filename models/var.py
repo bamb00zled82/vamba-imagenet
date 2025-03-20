@@ -7,7 +7,7 @@ import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 
 import dist
-from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
+#from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
 
@@ -80,40 +80,17 @@ class VAR(nn.Module):
         # 4. backbone blocks
         self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False), SharedAdaLin(self.D, 6*self.C)) if shared_aln else nn.Identity()
         
-        norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        self.drop_path_rate = drop_path_rate
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule (linearly increasing)
         self.blocks = nn.ModuleList([
-            AdaLNSelfAttn(
-                cond_dim=self.D, shared_aln=shared_aln,
-                block_idx=block_idx, embed_dim=self.C, norm_layer=norm_layer, num_heads=num_heads, mlp_ratio=mlp_ratio,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[block_idx], last_drop_p=0 if block_idx == 0 else dpr[block_idx-1],
-                attn_l2_norm=attn_l2_norm,
-                flash_if_available=flash_if_available, fused_if_available=fused_if_available,
+            Mamba(
+                d_model=self.C,  # Match embedding dimension
+                d_state=32,      # Internal state size
+                d_conv=8,        # Convolutional projection
+                expand=2         # Expansion ratio
             )
-            for block_idx in range(depth)
+            for _ in range(depth)
         ])
         
-        fused_add_norm_fns = [b.fused_add_norm_fn is not None for b in self.blocks]
-        self.using_fused_add_norm_fn = any(fused_add_norm_fns)
-        print(
-            f'\n[constructor]  ==== flash_if_available={flash_if_available} ({sum(b.attn.using_flash for b in self.blocks)}/{self.depth}), fused_if_available={fused_if_available} (fusing_add_ln={sum(fused_add_norm_fns)}/{self.depth}, fusing_mlp={sum(b.ffn.fused_mlp_func is not None for b in self.blocks)}/{self.depth}) ==== \n'
-            f'    [VAR config ] embed_dim={embed_dim}, num_heads={num_heads}, depth={depth}, mlp_ratio={mlp_ratio}\n'
-            f'    [drop ratios ] drop_rate={drop_rate}, attn_drop_rate={attn_drop_rate}, drop_path_rate={drop_path_rate:g} ({torch.linspace(0, drop_path_rate, depth)})',
-            end='\n\n', flush=True
-        )
-        
-        # 5. attention mask used in training (for masking out the future)
-        #    it won't be used in inference, since kv cache is enabled
-        d: torch.Tensor = torch.cat([torch.full((pn*pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L, 1)
-        dT = d.transpose(1, 2)    # dT: 11L
-        lvl_1L = dT[:, 0].contiguous()
-        self.register_buffer('lvl_1L', lvl_1L)
-        attn_bias_for_masking = torch.where(d >= dT, 0., -torch.inf).reshape(1, 1, self.L, self.L)
-        self.register_buffer('attn_bias_for_masking', attn_bias_for_masking.contiguous())
-        
         # 6. classifier head
-        self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)
     
     def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], cond_BD: Optional[torch.Tensor]):
@@ -157,17 +134,15 @@ class VAR(nn.Module):
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
         
-        for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L
             cur_L += pn*pn
-            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
-            AdaLNSelfAttn.forward
+
             for b in self.blocks:
-                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+                x = b(x) #mamba does not use attn blocks
             logits_BlV = self.get_logits(x, cond_BD)
             
             t = cfg * ratio
@@ -187,7 +162,6 @@ class VAR(nn.Module):
                 next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
                 next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
         
-        for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
     
     def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
@@ -207,20 +181,19 @@ class VAR(nn.Module):
             else: x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
             x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed] # lvl: BLC;  pos: 1LC
         
-        attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
-        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+        #cond_BD_or_gss = self.shared_ada_lin(cond_BD)
         
-        # hack: get the dtype if mixed precision is used
+        # Ensure mixed precision compatibility
         temp = x_BLC.new_ones(8, 8)
         main_type = torch.matmul(temp, temp).dtype
-        
+
         x_BLC = x_BLC.to(dtype=main_type)
-        cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
-        attn_bias = attn_bias.to(dtype=main_type)
+        cond_BD = cond_BD.to(dtype=main_type)  # No need for shared_ada_lin transformation
+
         
-        AdaLNSelfAttn.forward
-        for i, b in enumerate(self.blocks):
-            x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
+        for block in self.blocks:
+            x_BLC = block(x_BLC)  # Mamba operates sequentially
+
         x_BLC = self.get_logits(x_BLC.float(), cond_BD)
         
         if self.prog_si == 0:
@@ -264,30 +237,15 @@ class VAR(nn.Module):
                 self.head[-1].weight.data.mul_(init_head)
                 self.head[-1].bias.data.zero_()
         
-        if isinstance(self.head_nm, AdaLNBeforeHead):
-            self.head_nm.ada_lin[-1].weight.data.mul_(init_adaln)
-            if hasattr(self.head_nm.ada_lin[-1], 'bias') and self.head_nm.ada_lin[-1].bias is not None:
-                self.head_nm.ada_lin[-1].bias.data.zero_()
-        
+        # Apply Mamba-specific initialization
         depth = len(self.blocks)
-        for block_idx, sab in enumerate(self.blocks):
-            sab: AdaLNSelfAttn
-            sab.attn.proj.weight.data.div_(math.sqrt(2 * depth))
-            sab.ffn.fc2.weight.data.div_(math.sqrt(2 * depth))
-            if hasattr(sab.ffn, 'fcg') and sab.ffn.fcg is not None:
-                nn.init.ones_(sab.ffn.fcg.bias)
-                nn.init.trunc_normal_(sab.ffn.fcg.weight, std=1e-5)
-            if hasattr(sab, 'ada_lin'):
-                sab.ada_lin[-1].weight.data[2*self.C:].mul_(init_adaln)
-                sab.ada_lin[-1].weight.data[:2*self.C].mul_(init_adaln_gamma)
-                if hasattr(sab.ada_lin[-1], 'bias') and sab.ada_lin[-1].bias is not None:
-                    sab.ada_lin[-1].bias.data.zero_()
-            elif hasattr(sab, 'ada_gss'):
-                sab.ada_gss.data[:, :, 2:].mul_(init_adaln)
-                sab.ada_gss.data[:, :, :2].mul_(init_adaln_gamma)
-    
-    def extra_repr(self):
-        return f'drop_path_rate={self.drop_path_rate:g}'
+        for block_idx, mamba_block in enumerate(self.blocks):
+            if hasattr(mamba_block, 'mixer'):  # Mamba's state-space model component
+                nn.init.trunc_normal_(mamba_block.mixer.weight, std=init_std)
+                nn.init.zeros_(mamba_block.mixer.bias)
+        
+        def extra_repr(self):
+            return f'drop_path_rate={self.drop_path_rate:g}'
 
 
 class VARHF(VAR, PyTorchModelHubMixin):
