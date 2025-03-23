@@ -16,7 +16,31 @@ def sample_with_top_k_top_p_(logits_BlV: torch.Tensor, top_k: int = 0, top_p: fl
     # sample (have to squeeze cuz torch.multinomial can only be used for 2D tensor)
     replacement = num_samples >= 0
     num_samples = abs(num_samples)
-    return torch.multinomial(logits_BlV.softmax(dim=-1).view(-1, V), num_samples=num_samples, replacement=replacement, generator=rng).view(B, l, num_samples)
+    """
+    debug
+    """
+    # Convert logits to probs
+    probs = logits_BlV.softmax(dim=-1).view(-1, V)
+
+    # 🔍 Debug before sampling
+    print("⚠️ [DEBUG] probs shape:", probs.shape)
+    print("⚠️ [DEBUG] probs max:", probs.max().item(), "min:", probs.min().item())
+    print("⚠️ [DEBUG] logits shape:", logits_BlV.shape)
+
+    # 🛡️ Clamp and normalize to avoid numerical issues
+    probs = probs.clamp(min=1e-9)
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+
+    # Sample
+    try:
+        sample = torch.multinomial(probs, num_samples=num_samples, replacement=(num_samples >= 0), generator=rng)
+        print("⚠️ [DEBUG] sample max idx:", sample.max().item(), "sample shape:", sample.shape)
+    except Exception as e:
+        print("❌ torch.multinomial failed:", str(e))
+        raise e
+
+    return sample.view(B, l, num_samples)
+    #return torch.multinomial(logits_BlV.softmax(dim=-1).view(-1, V), num_samples=num_samples, replacement=replacement, generator=rng).view(B, l, num_samples)
 
 
 def gumbel_softmax_with_rng(logits: torch.Tensor, tau: float = 1, hard: bool = False, eps: float = 1e-10, dim: int = -1, rng: torch.Generator = None) -> torch.Tensor:
