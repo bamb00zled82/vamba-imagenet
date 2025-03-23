@@ -41,7 +41,7 @@ class VAR(nn.Module):
         self.L = sum(pn ** 2 for pn in self.patch_nums)
 
         # define lvl_1L
-        self.lvl_1L = nn.Parameter(torch.arange(self.L).unsqueeze(0), requires_grad=False)
+        self.register_buffer("lvl_1L", torch.arange(self.L).unsqueeze(0))
 
         self.first_l = self.patch_nums[0] ** 2
         self.begin_ends = []
