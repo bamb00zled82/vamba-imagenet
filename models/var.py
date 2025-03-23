@@ -39,6 +39,10 @@ class VAR(nn.Module):
         
         self.patch_nums: Tuple[int] = patch_nums
         self.L = sum(pn ** 2 for pn in self.patch_nums)
+
+        # define lvl_1L
+        self.lvl_1L = nn.Parameter(torch.arange(self.L).unsqueeze(0), requires_grad=False)
+
         self.first_l = self.patch_nums[0] ** 2
         self.begin_ends = []
         cur = 0
