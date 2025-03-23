@@ -23,7 +23,7 @@ import dist
 
 
 class Args(Tap):
-    data_path: str = '/path/to/imagenet'
+    data_path: str = '/home/yidapan/vamba/tiny-imagenet-200'
     exp_name: str = 'text'
     
     # VAE
