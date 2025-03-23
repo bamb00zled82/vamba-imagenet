@@ -33,6 +33,12 @@ def sample_with_top_k_top_p_(logits_BlV: torch.Tensor, top_k: int = 0, top_p: fl
 
     # Sample
     try:
+        print("⚠️ [DEBUG] probs max:", probs.max().item(), "min:", probs.min().item())
+        print("⚠️ [DEBUG] logits shape:", logits_BlV.shape)
+        torch.cuda.synchronize()
+        import sys
+        sys.stdout.flush()
+
         sample = torch.multinomial(probs, num_samples=num_samples, replacement=(num_samples >= 0), generator=rng)
         print("⚠️ [DEBUG] sample max idx:", sample.max().item(), "sample shape:", sample.shape)
     except Exception as e:
