@@ -154,6 +154,13 @@ class VAR(nn.Module):
             
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             if not more_smooth: # this is the default case
+                """ 
+                temporary debug
+                """
+                print(f"idx_Bl shape: {idx_Bl.shape}")
+                print(f"idx_Bl max: {idx_Bl.max().item()}, vocab size: {self.vocab_size}")
+                print(f"embedding weight shape: {self.vae_quant_proxy[0].embedding.weight.shape}")
+
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
             else:   # not used when evaluating FID/IS/Precision/Recall
                 gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
